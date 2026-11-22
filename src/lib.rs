@@ -101,6 +101,12 @@ pub extern "C" fn score() -> u32 {
     GAME.with(|g| g.borrow().score)
 }
 
+/// Returns the player's remaining lives (starts at `3`; game ends when `0`).
+#[no_mangle]
+pub extern "C" fn lives() -> u32 {
+    GAME.with(|g| g.borrow().lives)
+}
+
 /// Returns the number of living humans currently on the planet or being abducted.
 #[no_mangle]
 pub extern "C" fn humans_alive() -> u32 {

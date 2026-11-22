@@ -15,9 +15,12 @@ Save the humans on the surface from alien abduction! Pilot your ship across a 10
 | `←` / `→` (or `A` / `D`) | Thrust left / right |
 | `↑` / `↓` (or `W` / `S`) | Climb / dive |
 | `Space` | Fire laser |
+| `P` (or **PAUSE** button) | Pause / resume game |
 | `R` (or `Enter` on Game Over) | Restart game |
 
-### Scoring
+### Lives & Scoring
+
+- **Lives:** You start with **3 lives**. Losing a life respawns your ship with a brief warp-in animation; the game ends when all 3 lives are used up.
 
 - **Lander destroyed:** +150 pts
 - **Mutant destroyed:** +200 pts

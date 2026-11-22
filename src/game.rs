@@ -34,6 +34,8 @@ pub const SCREEN_WIDTH: usize = LOGICAL_WIDTH * PIXEL_SCALE;
 pub const SCREEN_HEIGHT: usize = LOGICAL_HEIGHT * PIXEL_SCALE;
 /// Total byte size of the RGBA framebuffer (4 bytes per pixel: Red, Green, Blue, Alpha).
 pub const FRAMEBUFFER_SIZE: usize = SCREEN_WIDTH * SCREEN_HEIGHT * 4;
+/// Number of lives the player starts with at the beginning of each game.
+pub const INITIAL_LIVES: u32 = 3;
 
 /// 7×8 pixel bitmaps for all 5 entity types, XOR-encoded with `69` (`0x45`, ASCII `'E'`).
 ///
@@ -191,6 +193,8 @@ pub struct Game {
     pub game_over: bool,
     /// Player score (awarded for destroying Landers, Mutants, and intercepting Bullets).
     pub score: u32,
+    /// Remaining player lives (starts at `INITIAL_LIVES = 3`; game ends when this reaches `0`).
+    pub lives: u32,
     /// Dynamic list (`Vec`) of all entities (`E` in JS). Index `0` is always the Player while alive.
     pub entities: Vec<Entity>,
     /// Currently pressed controls (`W` in JS).
@@ -223,6 +227,7 @@ impl Game {
             world_mask: WORLD_MASK,
             game_over: false,
             score: 0,
+            lives: INITIAL_LIVES,
             // Pre-allocate capacity for 64 entities to avoid early heap reallocations.
             entities: Vec::with_capacity(64),
             input: InputState::default(),
@@ -246,6 +251,7 @@ impl Game {
         self.world_mask = WORLD_MASK;
         self.game_over = false;
         self.score = 0;
+        self.lives = INITIAL_LIVES;
         self.entities.clear();
         self.input = InputState::default();
         self.next_entity_id = 1;
@@ -446,14 +452,33 @@ impl Game {
                     unlink_partner_id = self.entities[idx].target_id.take();
                     let prev_w = self.entities[idx].warp_explosion;
                     self.entities[idx].warp_explosion -= 1;
-                    // Once an explosion passes frame `-25`, remove the entity (and end
-                    // the game if it was the Player).
+                    // Once an explosion passes frame `-25`, remove the entity (or respawn
+                    // the Player if they still have lives remaining).
                     if prev_w < -25 {
                         if entity_kind == EntityKind::Player {
-                            self.world_mask = 0;
-                            self.game_over = true;
+                            // `saturating_sub(1)` decrements without underflowing below 0.
+                            self.lives = self.lives.saturating_sub(1);
+                            if self.lives > 0 {
+                                // Respawn the Player in place at mid-height with a 25-frame
+                                // warp-in animation (which also provides brief spawn invulnerability).
+                                let p = &mut self.entities[idx];
+                                p.warp_explosion = 25;
+                                p.vx = 0.0;
+                                p.vy = 0.0;
+                                p.y = 70.0;
+                                p.timer = 0;
+                                self.firing = false;
+                                // Clear active enemy bullets so the player isn't immediately spawn-killed.
+                                self.entities.retain(|e| e.kind != EntityKind::Bullet);
+                            } else {
+                                // All lives used up: stop the game and freeze the final frame.
+                                self.world_mask = 0;
+                                self.game_over = true;
+                                remove_entity = true;
+                            }
+                        } else {
+                            remove_entity = true;
                         }
-                        remove_entity = true;
                     }
                 } else {
                     // Entity is active in play (`w == 0`).
@@ -637,8 +662,12 @@ impl Game {
                         human.target_id = Some(lid);
                     }
                 }
-                if kill_player && !self.entities.is_empty() {
-                    // Matches JS1K: `E[0].w--` unconditionally on every overlapping enemy tick.
+                if kill_player
+                    && !self.entities.is_empty()
+                    && self.entities[0].warp_explosion <= 0
+                {
+                    // Decrement player's `w` when active (`0`) or already exploding (`< 0`),
+                    // while keeping the player invulnerable during respawn warp-in (`> 0`).
                     self.entities[0].warp_explosion -= 1;
                 }
 
@@ -884,10 +913,11 @@ mod tests {
         assert!(has_mutant, "abducted human reaching top should spawn a mutant");
     }
 
-    /// Verifies that colliding with an enemy explodes the Player and triggers Game Over (`world_mask == 0`).
+    /// Verifies that colliding with an enemy on the final life explodes the Player and triggers Game Over.
     #[test]
     fn enemy_collision_kills_player_and_ends_game() {
         let mut game = Game::new();
+        game.lives = 1;
         game.tick(); // Spawn player at (0, 70)
         game.entities.push(Entity {
             id: 777,
@@ -1064,6 +1094,7 @@ mod tests {
     #[test]
     fn game_over_freezes_last_frame_instead_of_clearing_black() {
         let mut game = Game::new();
+        game.lives = 1;
         game.tick(); // Spawn player
         game.entities.push(Entity {
             id: 777,
@@ -1188,5 +1219,57 @@ mod tests {
             game.entities[0].warp_explosion, 0,
             "player must not hit itself with its own laser at high velocity"
         );
+    }
+
+    /// Verifies that a new or reset game starts with 3 lives, respawns after losing
+    /// each of the first 2 lives with a warp-in, and ends only when all 3 lives are spent.
+    #[test]
+    fn three_lives_respawn_and_game_over_when_exhausted() {
+        let mut game = Game::new();
+        assert_eq!(game.lives, INITIAL_LIVES);
+        assert_eq!(game.lives, 3);
+
+        game.tick(); // Spawn player at (0, 70)
+        // Place a stationary enemy directly on the player to repeatedly trigger death
+        game.entities.push(Entity {
+            id: 779,
+            kind: EntityKind::Lander,
+            speed: 0.0,
+            warp_explosion: 0,
+            target_id: None,
+            vx: 0.0,
+            vy: 0.0,
+            timer: 999,
+            x: 0.0,
+            y: 70.0,
+        });
+
+        // Lose life 1 -> should drop to 2 lives and respawn with warp_explosion > 0
+        while game.lives == 3 {
+            game.tick();
+        }
+        assert_eq!(game.lives, 2);
+        assert!(!game.game_over);
+        assert_eq!(game.entities[0].kind, EntityKind::Player);
+        assert!(game.entities[0].warp_explosion > 0);
+
+        // Lose life 2 -> should drop to 1 life and still not be game over
+        while game.lives == 2 {
+            game.tick();
+        }
+        assert_eq!(game.lives, 1);
+        assert!(!game.game_over);
+
+        // Lose life 3 -> should reach 0 lives and trigger Game Over
+        while !game.game_over {
+            game.tick();
+        }
+        assert_eq!(game.lives, 0);
+        assert_eq!(game.world_mask, 0);
+
+        // Reset restores 3 lives
+        game.reset();
+        assert_eq!(game.lives, 3);
+        assert!(!game.game_over);
     }
 }

@@ -1,11 +1,14 @@
 const canvas = document.getElementById("game");
 const ctx = canvas.getContext("2d");
 const scoreEl = document.getElementById("score");
+const livesEl = document.getElementById("lives");
 const humansEl = document.getElementById("humans");
 const enemiesEl = document.getElementById("enemies");
 const overlayEl = document.getElementById("overlay");
-const finalScoreEl = document.getElementById("final-score");
-const restartBtn = document.getElementById("restart-btn");
+const overlayTitleEl = document.getElementById("overlay-title");
+const overlayMessageEl = document.getElementById("overlay-message");
+const overlayBtn = document.getElementById("overlay-btn");
+const pauseBtn = document.getElementById("pause-btn");
 
 const BIT_FIRE = 1;
 const BIT_LEFT = 2;
@@ -14,6 +17,7 @@ const BIT_RIGHT = 8;
 const BIT_DOWN = 16;
 
 let inputBits = 0;
+let isPaused = false;
 
 function keyToBit(code) {
   switch (code) {
@@ -62,20 +66,68 @@ async function main() {
 
   const imageData = ctx.createImageData(w, h);
 
+  const STEP_MS = 16;
+  let lastTime = performance.now();
+  let accumulator = 0;
+
+  function showGameOver(currentScore) {
+    overlayTitleEl.textContent = "GAME OVER";
+    overlayMessageEl.innerHTML = `Final Score: <strong>${currentScore}</strong>`;
+    overlayBtn.textContent = "PLAY AGAIN (R)";
+    overlayEl.classList.remove("hidden");
+  }
+
+  function togglePause() {
+    if (wasm.is_game_over()) return;
+    isPaused = !isPaused;
+    if (isPaused) {
+      inputBits = 0;
+      wasm.set_input(0);
+      pauseBtn.textContent = "RESUME (P)";
+      overlayTitleEl.textContent = "PAUSED";
+      overlayMessageEl.textContent = "Press P or click Resume to continue";
+      overlayBtn.textContent = "RESUME (P)";
+      overlayEl.classList.remove("hidden");
+    } else {
+      pauseBtn.textContent = "PAUSE (P)";
+      overlayEl.classList.add("hidden");
+      lastTime = performance.now();
+      accumulator = 0;
+    }
+  }
+
   function restartGame() {
+    isPaused = false;
     inputBits = 0;
     wasm.reset();
     wasm.set_input(0);
+    pauseBtn.textContent = "PAUSE (P)";
     overlayEl.classList.add("hidden");
+    lastTime = performance.now();
+    accumulator = 0;
   }
 
-  restartBtn.addEventListener("click", restartGame);
+  overlayBtn.addEventListener("click", () => {
+    if (isPaused && !wasm.is_game_over()) {
+      togglePause();
+    } else {
+      restartGame();
+    }
+  });
+  pauseBtn.addEventListener("click", togglePause);
 
   window.addEventListener("keydown", (event) => {
+    if (event.code === "KeyP" && !event.repeat) {
+      event.preventDefault();
+      togglePause();
+      return;
+    }
     if (event.code === "KeyR" || (event.code === "Enter" && wasm.is_game_over())) {
+      event.preventDefault();
       restartGame();
       return;
     }
+    if (isPaused) return;
     const bit = keyToBit(event.code);
     if (bit) {
       event.preventDefault();
@@ -98,20 +150,18 @@ async function main() {
     wasm.set_input(0);
   });
 
-  const STEP_MS = 16;
-  let lastTime = performance.now();
-  let accumulator = 0;
-
   function frame(now) {
     const dt = Math.min(now - lastTime, 100);
     lastTime = now;
-    accumulator += dt;
 
-    while (accumulator >= STEP_MS) {
-      if (!wasm.is_game_over()) {
-        wasm.tick();
+    if (!isPaused && !wasm.is_game_over()) {
+      accumulator += dt;
+      while (accumulator >= STEP_MS) {
+        if (!wasm.is_game_over()) {
+          wasm.tick();
+        }
+        accumulator -= STEP_MS;
       }
-      accumulator -= STEP_MS;
     }
 
     const ptr = wasm.framebuffer_ptr();
@@ -122,12 +172,12 @@ async function main() {
 
     const currentScore = wasm.score();
     scoreEl.textContent = String(currentScore);
+    livesEl.textContent = String(wasm.lives());
     humansEl.textContent = String(wasm.humans_alive());
     enemiesEl.textContent = String(wasm.enemies_alive());
 
-    if (wasm.is_game_over()) {
-      finalScoreEl.textContent = String(currentScore);
-      overlayEl.classList.remove("hidden");
+    if (!isPaused && wasm.is_game_over()) {
+      showGameOver(currentScore);
     }
 
     requestAnimationFrame(frame);

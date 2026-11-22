@@ -1,0 +1,14 @@
+[package]
+name = "defender"
+version = "0.1.0"
+edition = "2021"
+description = "Defender: 1024 reverse-engineered in Rust/WASM"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"

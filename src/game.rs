@@ -40,7 +40,7 @@ pub const SCREEN_HEIGHT: usize = TOTAL_LOGICAL_HEIGHT * PIXEL_SCALE;
 /// Total byte size of the RGBA framebuffer (4 bytes per pixel: Red, Green, Blue, Alpha).
 pub const FRAMEBUFFER_SIZE: usize = SCREEN_WIDTH * SCREEN_HEIGHT * 4;
 /// Number of lives the player starts with at the beginning of each game.
-pub const INITIAL_LIVES: u32 = 3;
+pub const INITIAL_LIVES: u32 = 5;
 /// Number of Smart Bombs the player starts with at the beginning of each game.
 pub const INITIAL_SMART_BOMBS: u32 = 3;
 /// Score interval required to earn each bonus Smart Bomb (every `10,000` points).
@@ -202,7 +202,7 @@ pub struct Game {
     pub game_over: bool,
     /// Player score (awarded for destroying Landers, Mutants, and intercepting Bullets).
     pub score: u32,
-    /// Remaining player lives (starts at `INITIAL_LIVES = 3`; game ends when this reaches `0`).
+    /// Remaining player lives (starts at `INITIAL_LIVES = 5`; game ends when this reaches `0`).
     pub lives: u32,
     /// Remaining Smart Bombs (starts at `INITIAL_SMART_BOMBS = 3`; `+1` every `10,000` points).
     pub smart_bombs: u32,
@@ -1668,13 +1668,13 @@ mod tests {
         );
     }
 
-    /// Verifies that a new or reset game starts with 3 lives, respawns after losing
-    /// each of the first 2 lives with a warp-in, and ends only when all 3 lives are spent.
+    /// Verifies that a new or reset game starts with 5 lives, respawns after losing
+    /// each of the first 4 lives with a warp-in, and ends only when all 5 lives are spent.
     #[test]
-    fn three_lives_respawn_and_game_over_when_exhausted() {
+    fn five_lives_respawn_and_game_over_when_exhausted() {
         let mut game = Game::new();
         assert_eq!(game.lives, INITIAL_LIVES);
-        assert_eq!(game.lives, 3);
+        assert_eq!(game.lives, 5);
 
         game.tick(); // Spawn player at (0, 70)
         // Place a stationary enemy directly on the player to repeatedly trigger death
@@ -1691,32 +1691,27 @@ mod tests {
             y: 70.0,
         });
 
-        // Lose life 1 -> should drop to 2 lives and respawn with warp_explosion > 0
-        while game.lives == 3 {
-            game.tick();
+        // Lose lives 5 -> 4 -> 3 -> 2 -> 1, respawning each time with warp_explosion > 0
+        for expected_remaining in (1..=4).rev() {
+            while game.lives > expected_remaining {
+                game.tick();
+            }
+            assert_eq!(game.lives, expected_remaining);
+            assert!(!game.game_over);
+            assert_eq!(game.entities[0].kind, EntityKind::Player);
+            assert!(game.entities[0].warp_explosion > 0);
         }
-        assert_eq!(game.lives, 2);
-        assert!(!game.game_over);
-        assert_eq!(game.entities[0].kind, EntityKind::Player);
-        assert!(game.entities[0].warp_explosion > 0);
 
-        // Lose life 2 -> should drop to 1 life and still not be game over
-        while game.lives == 2 {
-            game.tick();
-        }
-        assert_eq!(game.lives, 1);
-        assert!(!game.game_over);
-
-        // Lose life 3 -> should reach 0 lives and trigger Game Over
+        // Lose final life -> should reach 0 lives and trigger Game Over
         while !game.game_over {
             game.tick();
         }
         assert_eq!(game.lives, 0);
         assert_eq!(game.world_mask, 0);
 
-        // Reset restores 3 lives
+        // Reset restores 5 lives
         game.reset();
-        assert_eq!(game.lives, 3);
+        assert_eq!(game.lives, 5);
         assert!(!game.game_over);
     }
 
@@ -2008,10 +2003,12 @@ mod tests {
         assert_ne!(logical_pixel_rgb(&game, 54, 13), (0, 0, 0));
         assert_eq!(logical_pixel_rgb(&game, 54, 18), (0, 0, 0));
 
-        // Reserve Life Ship icons on upper-left (`lx = 4, 13, 22` at `ly = 8` for 3 lives).
+        // Reserve Life Ship icons on upper-left (`lx = 4, 13, 22, 31, 40` at `ly = 8` for 5 lives).
         assert_eq!(logical_pixel_rgb(&game, 5, 8), (255, 45, 45));
         assert_eq!(logical_pixel_rgb(&game, 14, 8), (255, 45, 45));
         assert_eq!(logical_pixel_rgb(&game, 23, 8), (255, 45, 45));
-        assert_eq!(logical_pixel_rgb(&game, 32, 8), (0, 0, 0));
+        assert_eq!(logical_pixel_rgb(&game, 32, 8), (255, 45, 45));
+        assert_eq!(logical_pixel_rgb(&game, 41, 8), (255, 45, 45));
+        assert_eq!(logical_pixel_rgb(&game, 49, 8), (0, 0, 0));
     }
 }

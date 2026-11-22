@@ -101,7 +101,7 @@ pub extern "C" fn score() -> u32 {
     GAME.with(|g| g.borrow().score)
 }
 
-/// Returns the player's remaining lives (starts at `3`; game ends when `0`).
+/// Returns the player's remaining lives (starts at `5`; game ends when `0`).
 #[no_mangle]
 pub extern "C" fn lives() -> u32 {
     GAME.with(|g| g.borrow().lives)

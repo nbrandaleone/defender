@@ -22,7 +22,7 @@ Save the humans on the surface from alien abduction! Pilot your ship across a 10
 
 ### Lives, Abilities & Scoring
 
-- **Lives:** You start with **3 lives** (also shown as miniature red Defender ship icons in the upper-left HUD). Losing a life respawns your ship with a brief warp-in animation; the game ends when all 3 lives are used up.
+- **Lives:** You start with **5 lives** (also shown as miniature red Defender ship icons in the upper-left HUD). Losing a life respawns your ship with a brief warp-in animation; the game ends when all 5 lives are used up.
 - **Smart Bomb (`Z`):** You start with **3 Smart Bombs** (displayed as stacked torpedo icons left of the radar scanner) and earn **+1 bonus bomb every 10,000 points**. Triggering a Smart Bomb flashes the playfield and destroys every on-screen Lander, Mutant, and enemy bullet—awarding full points and safely releasing any abducted humans.
 - **Hyperspace (`H`):** Unlimited emergency jump that teleports your ship to a random position (`x` in `0..1024`, `y` in `12..132`), snaps the camera to the new location, and resets horizontal velocity—with no invulnerability, so landing near an enemy is genuinely risky.
 - **Top-of-Screen Radar Scanner:** A classic 8:1 scale overview of the full 1024-pixel wrapping planet centered on your viewport, displaying white viewport brackets, the miniature mountain range, your ship (`+`), humans, Landers, and Mutants, flanked by reserve life ships and stacked Smart Bomb icons.

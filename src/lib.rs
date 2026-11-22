@@ -89,7 +89,7 @@ pub extern "C" fn width() -> u32 {
     SCREEN_WIDTH as u32
 }
 
-/// Returns the canvas height in pixels (`320`).
+/// Returns the canvas height in pixels (`376`: `56`-px radar HUD + `320`-px playfield).
 #[no_mangle]
 pub extern "C" fn height() -> u32 {
     SCREEN_HEIGHT as u32
@@ -105,6 +105,28 @@ pub extern "C" fn score() -> u32 {
 #[no_mangle]
 pub extern "C" fn lives() -> u32 {
     GAME.with(|g| g.borrow().lives)
+}
+
+/// Returns the player's remaining Smart Bombs (starts at `3`, plus `+1` every `10,000` points).
+#[no_mangle]
+pub extern "C" fn smart_bombs() -> u32 {
+    GAME.with(|g| g.borrow().smart_bombs)
+}
+
+/// Detonates a Smart Bomb, destroying all visible on-screen enemies and bullets.
+///
+/// Does nothing if the game is over, no Smart Bombs remain, or the player is missing/exploding.
+#[no_mangle]
+pub extern "C" fn trigger_smart_bomb() {
+    GAME.with(|g| g.borrow_mut().trigger_smart_bomb());
+}
+
+/// Activates Hyperspace, instantly teleporting the player to a random location on the planet.
+///
+/// Unlimited uses whenever the game is active and the player is alive (`warp_explosion == 0`).
+#[no_mangle]
+pub extern "C" fn trigger_hyperspace() {
+    GAME.with(|g| g.borrow_mut().trigger_hyperspace());
 }
 
 /// Returns the number of living humans currently on the planet or being abducted.

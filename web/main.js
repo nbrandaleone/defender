@@ -2,6 +2,7 @@ const canvas = document.getElementById("game");
 const ctx = canvas.getContext("2d");
 const scoreEl = document.getElementById("score");
 const livesEl = document.getElementById("lives");
+const bombsEl = document.getElementById("bombs");
 const humansEl = document.getElementById("humans");
 const enemiesEl = document.getElementById("enemies");
 const overlayEl = document.getElementById("overlay");
@@ -127,7 +128,17 @@ async function main() {
       restartGame();
       return;
     }
-    if (isPaused) return;
+    if (isPaused || wasm.is_game_over()) return;
+    if (event.code === "KeyZ" && !event.repeat) {
+      event.preventDefault();
+      wasm.trigger_smart_bomb();
+      return;
+    }
+    if (event.code === "KeyH" && !event.repeat) {
+      event.preventDefault();
+      wasm.trigger_hyperspace();
+      return;
+    }
     const bit = keyToBit(event.code);
     if (bit) {
       event.preventDefault();
@@ -173,6 +184,7 @@ async function main() {
     const currentScore = wasm.score();
     scoreEl.textContent = String(currentScore);
     livesEl.textContent = String(wasm.lives());
+    bombsEl.textContent = String(wasm.smart_bombs());
     humansEl.textContent = String(wasm.humans_alive());
     enemiesEl.textContent = String(wasm.enemies_alive());
 

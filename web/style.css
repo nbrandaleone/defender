@@ -120,9 +120,9 @@ body {
 
 .screen-wrap {
   position: relative;
-  width: min(100cqw, calc(100cqh * 510 / 320));
-  height: min(100cqh, calc(100cqw * 320 / 510));
-  aspect-ratio: 510 / 320;
+  width: min(100cqw, calc(100cqh * 510 / 376));
+  height: min(100cqh, calc(100cqw * 376 / 510));
+  aspect-ratio: 510 / 376;
   background: #000;
   border: 2px solid #2b3959;
   border-radius: 6px;

@@ -11,8 +11,9 @@
 //! ## How the Game Works
 //! - The planet is a **1024-pixel wrapping horizontal world**: moving past `1023`
 //!   wraps seamlessly back to `0` using bitwise AND (`& 1023`, since `1023 == 0x3FF`).
-//! - The visible viewport is `255 × 160` logical pixels, drawn as `2 × 2` blocks
-//!   into a `510 × 320` RGBA pixel buffer.
+//! - The visible playfield is `255 × 160` logical pixels beneath a `255 × 28`
+//!   classic Defender radar & status HUD (`255 × 188` total logical pixels), drawn
+//!   as `2 × 2` blocks into a `510 × 376` RGBA pixel buffer.
 //! - Each entity has a 7×8 bitmap sprite stored in `SPRITE_DATA` and a single
 //!   integer counter `warp_explosion` (`w` in JS) that drives both warp-in
 //!   animations (`w > 0`) and pixel-scatter explosions (`w < 0`).
@@ -24,18 +25,26 @@ pub const WORLD_WIDTH: i32 = 1024;
 pub const WORLD_MASK: i32 = 1023;
 /// Logical viewport width in game pixels (original JS checks `X < 255`).
 pub const LOGICAL_WIDTH: usize = 255;
-/// Logical viewport height in game pixels.
+/// Logical playfield height in game pixels (`y = 0..160`).
 pub const LOGICAL_HEIGHT: usize = 160;
+/// Height of the top-of-screen classic Defender radar and HUD band (in logical pixels).
+pub const RADAR_HEIGHT: usize = 28;
+/// Combined logical height of the radar HUD (`28`) plus the playfield (`160`) = `188`.
+pub const TOTAL_LOGICAL_HEIGHT: usize = RADAR_HEIGHT + LOGICAL_HEIGHT;
 /// Each logical pixel is rendered as a `2 × 2` square on screen (`X << 1, Y << 1, 2, 2`).
 pub const PIXEL_SCALE: usize = 2;
 /// Final framebuffer width in screen pixels (`255 * 2 = 510`).
 pub const SCREEN_WIDTH: usize = LOGICAL_WIDTH * PIXEL_SCALE;
-/// Final framebuffer height in screen pixels (`160 * 2 = 320`).
-pub const SCREEN_HEIGHT: usize = LOGICAL_HEIGHT * PIXEL_SCALE;
+/// Final framebuffer height in screen pixels (`188 * 2 = 376`).
+pub const SCREEN_HEIGHT: usize = TOTAL_LOGICAL_HEIGHT * PIXEL_SCALE;
 /// Total byte size of the RGBA framebuffer (4 bytes per pixel: Red, Green, Blue, Alpha).
 pub const FRAMEBUFFER_SIZE: usize = SCREEN_WIDTH * SCREEN_HEIGHT * 4;
 /// Number of lives the player starts with at the beginning of each game.
 pub const INITIAL_LIVES: u32 = 3;
+/// Number of Smart Bombs the player starts with at the beginning of each game.
+pub const INITIAL_SMART_BOMBS: u32 = 3;
+/// Score interval required to earn each bonus Smart Bomb (every `10,000` points).
+pub const SMART_BOMB_SCORE_STEP: u32 = 10_000;
 
 /// 7×8 pixel bitmaps for all 5 entity types, XOR-encoded with `69` (`0x45`, ASCII `'E'`).
 ///
@@ -195,6 +204,17 @@ pub struct Game {
     pub score: u32,
     /// Remaining player lives (starts at `INITIAL_LIVES = 3`; game ends when this reaches `0`).
     pub lives: u32,
+    /// Remaining Smart Bombs (starts at `INITIAL_SMART_BOMBS = 3`; `+1` every `10,000` points).
+    pub smart_bombs: u32,
+    /// Next score threshold at which the player earns a bonus Smart Bomb (starts at `10,000`).
+    pub next_bomb_score: u32,
+    /// Countdown timer (in frames) for the white/cyan Smart Bomb screen flash effect.
+    pub bomb_flash: u8,
+    /// Countdown timer (in frames) for the Hyperspace arrival sparkle effect.
+    pub hyperspace_flash: u8,
+    /// Internal state of the lightweight `xorshift64` pseudo-random number generator
+    /// used by Hyperspace (keeps zero external crate dependencies and stays testable).
+    rng_state: u64,
     /// Dynamic list (`Vec`) of all entities (`E` in JS). Index `0` is always the Player while alive.
     pub entities: Vec<Entity>,
     /// Currently pressed controls (`W` in JS).
@@ -208,6 +228,9 @@ pub struct Game {
     /// rendered directly in Rust and copied to the HTML `<canvas>` each frame.
     pub framebuffer: Vec<u8>,
 }
+
+/// Default non-zero seed for the `xorshift64` PRNG (the 64-bit golden ratio constant).
+const INITIAL_RNG_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
 
 /// Implementing `Default` lets callers construct a `Game` via `Game::default()`.
 impl Default for Game {
@@ -228,6 +251,11 @@ impl Game {
             game_over: false,
             score: 0,
             lives: INITIAL_LIVES,
+            smart_bombs: INITIAL_SMART_BOMBS,
+            next_bomb_score: SMART_BOMB_SCORE_STEP,
+            bomb_flash: 0,
+            hyperspace_flash: 0,
+            rng_state: INITIAL_RNG_SEED,
             // Pre-allocate capacity for 64 entities to avoid early heap reallocations.
             entities: Vec::with_capacity(64),
             input: InputState::default(),
@@ -252,6 +280,11 @@ impl Game {
         self.game_over = false;
         self.score = 0;
         self.lives = INITIAL_LIVES;
+        self.smart_bombs = INITIAL_SMART_BOMBS;
+        self.next_bomb_score = SMART_BOMB_SCORE_STEP;
+        self.bomb_flash = 0;
+        self.hyperspace_flash = 0;
+        self.rng_state = INITIAL_RNG_SEED;
         self.entities.clear();
         self.input = InputState::default();
         self.next_entity_id = 1;
@@ -263,6 +296,142 @@ impl Game {
     /// Replaces the current keyboard input state.
     pub fn set_input(&mut self, input: InputState) {
         self.input = input;
+    }
+
+    /// Adds `points` to `self.score` and awards `+1` Smart Bomb for every
+    /// `SMART_BOMB_SCORE_STEP` (`10,000`) point threshold crossed.
+    ///
+    /// Using a `while` loop handles the rare case where a single large score
+    /// jump crosses multiple 10,000-point milestones at once.
+    fn add_score(&mut self, points: u32) {
+        self.score = self.score.saturating_add(points);
+        while self.score >= self.next_bomb_score {
+            self.smart_bombs = self.smart_bombs.saturating_add(1);
+            self.next_bomb_score = self.next_bomb_score.saturating_add(SMART_BOMB_SCORE_STEP);
+        }
+    }
+
+    /// Advances the `xorshift64` PRNG and returns the next pseudo-random `u64`.
+    ///
+    /// `xorshift64` uses three bit-shifts and XOR operations (`^=`) to produce a
+    /// fast, well-distributed 64-bit sequence with zero external crates.
+    fn next_random_u64(&mut self) -> u64 {
+        let mut x = self.rng_state;
+        // xorshift64 has a fixed point at 0; guard against it by re-seeding.
+        if x == 0 {
+            x = INITIAL_RNG_SEED;
+        }
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.rng_state = x;
+        x
+    }
+
+    /// Detonates a Smart Bomb, destroying all active or warping-in enemies
+    /// (`Lander`, `Mutant`, and `Bullet`) currently visible in the `255`-px viewport.
+    ///
+    /// - Does nothing if the game is over, `smart_bombs == 0`, or the Player is
+    ///   missing or currently exploding (`warp_explosion < 0`).
+    /// - Sets each affected enemy's `warp_explosion = -1` so it explodes and safely
+    ///   unlinks any abducted Human so the Human falls back to Earth.
+    /// - Awards full points (`+150` Lander, `+200` Mutant, `+50` Bullet), which can
+    ///   also grant bonus Smart Bombs when crossing a `10,000`-point boundary.
+    pub fn trigger_smart_bomb(&mut self) {
+        if self.game_over || self.world_mask == 0 || self.smart_bombs == 0 {
+            return;
+        }
+        // Ensure the Player exists at index 0 and is not currently exploding.
+        let Some(player) = self.entities.first() else {
+            return;
+        };
+        if player.kind != EntityKind::Player || player.warp_explosion < 0 {
+            return;
+        }
+
+        self.smart_bombs -= 1;
+        // Trigger an 8-frame white/cyan playfield flash that fades smoothly back to black.
+        self.bomb_flash = 8;
+
+        let mut points: u32 = 0;
+        let mut unlinked_human_ids: Vec<u32> = Vec::new();
+
+        for entity in &mut self.entities {
+            if !matches!(
+                entity.kind,
+                EntityKind::Lander | EntityKind::Mutant | EntityKind::Bullet
+            ) {
+                continue;
+            }
+            // Skip enemies that are already exploding (`warp_explosion < 0`).
+            if entity.warp_explosion < 0 {
+                continue;
+            }
+            // Compute the entity's wrapped logical X coordinate inside the 255-px viewport.
+            let screen_x = to_i32(entity.x - self.camera_x + 127.0) & self.world_mask;
+            if screen_x < LOGICAL_WIDTH as i32 {
+                entity.warp_explosion = -1;
+                if let Some(human_id) = entity.target_id.take() {
+                    unlinked_human_ids.push(human_id);
+                }
+                points += match entity.kind {
+                    EntityKind::Lander => 150,
+                    EntityKind::Mutant => 200,
+                    EntityKind::Bullet => 50,
+                    _ => 0,
+                };
+            }
+        }
+
+        // Immediately release any Humans whose abducting Lander was destroyed.
+        for human_id in unlinked_human_ids {
+            if let Some(human) = self.entities.iter_mut().find(|e| e.id == human_id) {
+                human.target_id = None;
+            }
+        }
+
+        self.add_score(points);
+    }
+
+    /// Teleports the Player to a random position on the planet (`x` in `0..1024`,
+    /// `y` in `12..132`) with unlimited uses while alive.
+    ///
+    /// - Does nothing if the game is over or the Player is not in normal active
+    ///   play (`warp_explosion != 0`).
+    /// - Resets horizontal velocity (`vx = 0.0`), snaps `camera_x = x`, cancels any
+    ///   active laser (`firing = false`), and triggers a brief visual sparkle without
+    ///   granting invulnerability — landing near an enemy is genuinely dangerous!
+    pub fn trigger_hyperspace(&mut self) {
+        if self.game_over || self.world_mask == 0 {
+            return;
+        }
+        let Some(player) = self.entities.first() else {
+            return;
+        };
+        if player.kind != EntityKind::Player || player.warp_explosion != 0 {
+            return;
+        }
+
+        // Mix the current tick count and player coordinates into the PRNG state so
+        // real gameplay timing influences the teleport destination while repeated
+        // calls in tests still produce distinct locations.
+        let entropy = (self.ticks as u64)
+            .wrapping_mul(0x517C_C1B7_2722_0A95)
+            ^ player.x.to_bits()
+            ^ player.y.to_bits().rotate_left(17);
+        self.rng_state = self.rng_state.wrapping_add(entropy) ^ entropy.rotate_left(31);
+
+        let new_x = (self.next_random_u64() & (WORLD_MASK as u64)) as f64;
+        let new_y = 12.0 + ((self.next_random_u64() % 120) as f64);
+
+        let player = &mut self.entities[0];
+        player.x = new_x;
+        player.y = new_y;
+        player.vx = 0.0;
+
+        self.camera_x = new_x;
+        self.firing = false;
+        self.hyperspace_flash = 6;
     }
 
     /// Counts how many living humans remain (neither dead nor currently exploding).
@@ -325,11 +494,49 @@ impl Game {
         }
     }
 
-    /// Plots a `2 × 2` pixel block at logical coordinate `(lx, ly)` with the given `(r, g, b)` color.
+    /// Clears the top radar band to black and clears the playfield below it to either
+    /// black or a fading white/cyan flash when a Smart Bomb was just detonated.
+    fn clear_frame(&mut self) {
+        let radar_bytes = RADAR_HEIGHT * PIXEL_SCALE * SCREEN_WIDTH * 4;
+        // Split the framebuffer into two non-overlapping mutable slices:
+        // `radar_buf` (top 56 screen rows) and `playfield_buf` (bottom 320 screen rows).
+        let (radar_buf, playfield_buf) = self.framebuffer.split_at_mut(radar_bytes);
+
+        for px in radar_buf.chunks_exact_mut(4) {
+            px[0] = 0;
+            px[1] = 0;
+            px[2] = 0;
+            px[3] = 255;
+        }
+
+        // Compute the playfield background color: black normally, or fading white/cyan
+        // during the 8-frame Smart Bomb flash (`bomb_flash` counts down 8 -> 1).
+        let (bg_r, bg_g, bg_b) = if self.bomb_flash > 0 {
+            let intensity = self.bomb_flash as u16;
+            (
+                (intensity * 28).min(255) as u8,
+                (intensity * 32).min(255) as u8,
+                (intensity * 32).min(255) as u8,
+            )
+        } else {
+            (0, 0, 0)
+        };
+
+        for px in playfield_buf.chunks_exact_mut(4) {
+            px[0] = bg_r;
+            px[1] = bg_g;
+            px[2] = bg_b;
+            px[3] = 255;
+        }
+    }
+
+    /// Plots a `2 × 2` pixel block at full-screen logical coordinate `(lx, ly)` where
+    /// `ly = 0..RADAR_HEIGHT` is the radar HUD and `ly = RADAR_HEIGHT..TOTAL_LOGICAL_HEIGHT`
+    /// is the playfield.
     ///
-    /// Coordinates outside the `255 × 160` logical viewport are safely ignored.
-    fn plot_pixel(&mut self, lx: i32, ly: i32, rgb: (u8, u8, u8)) {
-        if lx < 0 || ly < 0 || lx >= LOGICAL_WIDTH as i32 || ly >= LOGICAL_HEIGHT as i32 {
+    /// Coordinates outside the `255 × 188` logical screen are safely ignored.
+    fn plot_screen_pixel(&mut self, lx: i32, ly: i32, rgb: (u8, u8, u8)) {
+        if lx < 0 || ly < 0 || lx >= LOGICAL_WIDTH as i32 || ly >= TOTAL_LOGICAL_HEIGHT as i32 {
             return;
         }
         // Convert logical coordinate to top-left screen pixel coordinate (2× scale).
@@ -344,6 +551,222 @@ impl Game {
                 self.framebuffer[idx + 1] = rgb.1;
                 self.framebuffer[idx + 2] = rgb.2;
                 self.framebuffer[idx + 3] = 255;
+            }
+        }
+    }
+
+    /// Plots a `2 × 2` pixel block inside the `255 × 160` playfield, automatically
+    /// offsetting `ly` downward by `RADAR_HEIGHT` (`+28`) so all original game
+    /// coordinates (`y = 0..160`) remain unchanged and never bleed into the radar HUD.
+    fn plot_playfield_pixel(&mut self, lx: i32, ly: i32, rgb: (u8, u8, u8)) {
+        if lx < 0 || ly < 0 || lx >= LOGICAL_WIDTH as i32 || ly >= LOGICAL_HEIGHT as i32 {
+            return;
+        }
+        self.plot_screen_pixel(lx, ly + RADAR_HEIGHT as i32, rgb);
+    }
+
+    /// Renders a brief expanding cyan/white sparkle around the Player ship right after
+    /// activating Hyperspace (purely visual — grants no invulnerability).
+    fn render_hyperspace_sparkle(&mut self) {
+        if self.hyperspace_flash == 0 {
+            return;
+        }
+        let Some(player) = self.entities.first() else {
+            return;
+        };
+        if player.kind != EntityKind::Player {
+            return;
+        }
+        let px = to_i32(player.x - self.camera_x + 127.0) & self.world_mask;
+        let py = to_i32(player.y);
+        // Expand sparkle radius from 3px out to 8px as `hyperspace_flash` counts down 6 -> 1.
+        let radius = (9 - self.hyperspace_flash as i32).max(2);
+        let color = if self.hyperspace_flash % 2 == 0 {
+            (255, 255, 255)
+        } else {
+            (100, 255, 255)
+        };
+        let offsets = [
+            (-radius, 0),
+            (radius, 0),
+            (0, -radius),
+            (0, radius),
+            (-radius / 2, -radius / 2),
+            (radius / 2, -radius / 2),
+            (-radius / 2, radius / 2),
+            (radius / 2, radius / 2),
+        ];
+        for (ox, oy) in offsets {
+            self.plot_playfield_pixel(px + ox, py + oy, color);
+        }
+    }
+
+    /// Renders the classic Williams Defender top-of-screen HUD (`ly = 0..28`):
+    /// - Full-width royal-blue divider line at `ly = 27`
+    /// - Centered 128-px Radar Scanner (`lx = 64..192`, exact 8:1 scale of the 1024-px world)
+    ///   with miniature orange-brown mountains, white viewport brackets (`lx = 112..144`),
+    ///   and live blips for the Player (`+`), Humans, Landers, and Mutants
+    /// - Stacked Smart Bomb torpedo icons just left of the radar (`lx = 51..60`)
+    /// - Reserve Life Ship icons on the upper-left (`lx = 4..46`)
+    fn render_radar_hud(&mut self, mountain_heights: &[f64; WORLD_WIDTH as usize]) {
+        const HUD_BLUE: (u8, u8, u8) = (40, 60, 235);
+        const BRACKET_WHITE: (u8, u8, u8) = (255, 255, 255);
+        const RADAR_MOUNTAIN: (u8, u8, u8) = (195, 95, 20);
+        const BLIP_HUMAN: (u8, u8, u8) = (180, 255, 190);
+        const BLIP_LANDER: (u8, u8, u8) = (255, 50, 255);
+        const BLIP_MUTANT: (u8, u8, u8) = (255, 190, 20);
+        const BLIP_PLAYER: (u8, u8, u8) = (255, 255, 255);
+
+        // 1. Full-width royal-blue divider bar along the bottom of the HUD (`ly = 27`).
+        for lx in 0..LOGICAL_WIDTH as i32 {
+            self.plot_screen_pixel(lx, 27, HUD_BLUE);
+        }
+
+        // 2. Centered Radar Box frame (`lx = 63..=192`, top bar `ly = 0`, side walls `ly = 0..=27`).
+        for lx in 63..=192 {
+            self.plot_screen_pixel(lx, 0, HUD_BLUE);
+        }
+        for ly in 0..=27 {
+            self.plot_screen_pixel(63, ly, HUD_BLUE);
+            self.plot_screen_pixel(192, ly, HUD_BLUE);
+        }
+
+        // 3. Miniature orange-brown mountain range across all 128 radar columns (`lx = 64..192`),
+        //    centered on the active viewport center (`camera_x + 127`).
+        let center_x = self.camera_x + 127.0;
+        for rx in 0..128_i32 {
+            // Each radar column spans 8 world pixels (`rx = 64` maps to `center_x`).
+            let world_x = to_i32(center_x + ((rx - 64) * 8) as f64) & WORLD_MASK;
+            let mh = mountain_heights[world_x as usize];
+            let ry = (2.0 + (mh / LOGICAL_HEIGHT as f64) * 23.0)
+                .round()
+                .clamp(2.0, 25.0) as i32;
+            self.plot_screen_pixel(64 + rx, ry, RADAR_MOUNTAIN);
+        }
+
+        // 4. White viewport brackets centered at `lx = 112..144` (32 logical px = 255/1024 slice).
+        for lx in 112..=143 {
+            self.plot_screen_pixel(lx, 1, BRACKET_WHITE);
+            self.plot_screen_pixel(lx, 26, BRACKET_WHITE);
+        }
+        // 2-px inward vertical corner ticks on top and bottom brackets.
+        for dy in 0..2 {
+            self.plot_screen_pixel(112, 2 + dy, BRACKET_WHITE);
+            self.plot_screen_pixel(143, 2 + dy, BRACKET_WHITE);
+            self.plot_screen_pixel(112, 24 + dy, BRACKET_WHITE);
+            self.plot_screen_pixel(143, 24 + dy, BRACKET_WHITE);
+        }
+
+        // 5. Entity radar blips (Humans, Landers, Mutants first; Player `+` drawn last on top).
+        let mut player_blip: Option<(i32, i32)> = None;
+        for idx in 0..self.entities.len() {
+            let (kind, ex, ey, warp_exp) = {
+                let e = &self.entities[idx];
+                (e.kind, e.x, e.y, e.warp_explosion)
+            };
+            // Hide exploding entities and tiny enemy bullets from the radar.
+            if warp_exp < 0 || kind == EntityKind::Bullet {
+                continue;
+            }
+            // Entities render at screen X `(ex - camera_x + 127) & 1023`, so `self.camera_x`
+            // is the world X at the center of the 255-px viewport (`px = 127`).
+            // Signed shortest wrapped delta in `[-512, +511]` relative to `self.camera_x`.
+            let dx = (to_i32(ex - self.camera_x + 512.0) & WORLD_MASK) - 512;
+            let bx = (128 + (dx >> 3)).clamp(64, 191);
+            let by = (2.0 + (ey / LOGICAL_HEIGHT as f64) * 23.0)
+                .round()
+                .clamp(2.0, 25.0) as i32;
+
+            match kind {
+                EntityKind::Player => {
+                    player_blip = Some((bx, by));
+                }
+                EntityKind::Human => {
+                    self.plot_screen_pixel(bx, by, BLIP_HUMAN);
+                    self.plot_screen_pixel(bx, (by + 1).min(25), BLIP_HUMAN);
+                }
+                EntityKind::Lander => {
+                    self.plot_screen_pixel(bx, by, BLIP_LANDER);
+                    self.plot_screen_pixel((bx + 1).min(191), by, BLIP_LANDER);
+                    self.plot_screen_pixel(bx, (by + 1).min(25), BLIP_LANDER);
+                }
+                EntityKind::Mutant => {
+                    self.plot_screen_pixel(bx, by, BLIP_MUTANT);
+                    self.plot_screen_pixel((bx + 1).min(191), by, BLIP_MUTANT);
+                    self.plot_screen_pixel(bx, (by + 1).min(25), BLIP_MUTANT);
+                }
+                EntityKind::Bullet => {}
+            }
+        }
+
+        // Draw the Player's bright white 3×3 `+` cross on top of all other blips.
+        if let Some((px, py)) = player_blip {
+            let cross = [(0, 0), (-1, 0), (1, 0), (0, -1), (0, 1)];
+            for (ox, oy) in cross {
+                let cx = px + ox;
+                let cy = py + oy;
+                if (64..=191).contains(&cx) && (2..=25).contains(&cy) {
+                    self.plot_screen_pixel(cx, cy, BLIP_PLAYER);
+                }
+            }
+        }
+
+        // 6. Smart Bomb icons stacked vertically just left of the radar box (`lx = 52..=58`).
+        //    Up to 5 crisp 7×4 torpedo icons with silver-white fins, white body, cyan/green nose.
+        const BOMB_FIN: (u8, u8, u8) = (210, 225, 240);
+        const BOMB_BODY: (u8, u8, u8) = (255, 255, 255);
+        const BOMB_NOSE: (u8, u8, u8) = (40, 255, 200);
+        // 4 rows × 7 columns: 0 = empty, 1 = fin, 2 = body, 3 = cyan/green warhead nose.
+        const BOMB_SPRITE: [[u8; 7]; 4] = [
+            [1, 0, 2, 2, 0, 0, 0],
+            [1, 1, 2, 2, 3, 3, 3],
+            [1, 1, 2, 2, 3, 3, 3],
+            [1, 0, 2, 2, 0, 0, 0],
+        ];
+        let bombs_to_draw = self.smart_bombs.min(5) as i32;
+        for i in 0..bombs_to_draw {
+            let base_x = 52;
+            let base_y = 2 + i * 5;
+            for (row_idx, row) in BOMB_SPRITE.iter().enumerate() {
+                for (col_idx, &cell) in row.iter().enumerate() {
+                    let color = match cell {
+                        1 => BOMB_FIN,
+                        2 => BOMB_BODY,
+                        3 => BOMB_NOSE,
+                        _ => continue,
+                    };
+                    self.plot_screen_pixel(base_x + col_idx as i32, base_y + row_idx as i32, color);
+                }
+            }
+        }
+
+        // 7. Reserve Life Ship icons on the upper-left (`lx = 4..46`), showing miniature
+        //    7×5 red Defender ships for remaining lives (up to 5 icons).
+        const SHIP_RED: (u8, u8, u8) = (255, 45, 45);
+        const SHIP_COCKPIT: (u8, u8, u8) = (255, 255, 255);
+        const SHIP_THRUST: (u8, u8, u8) = (80, 210, 255);
+        // 5 rows × 7 columns: 0 = empty, 1 = red hull, 2 = white cockpit, 3 = cyan thruster.
+        const LIFE_SHIP_SPRITE: [[u8; 7]; 5] = [
+            [0, 0, 1, 1, 0, 0, 0],
+            [1, 1, 1, 2, 2, 0, 0],
+            [3, 1, 1, 1, 1, 1, 1],
+            [1, 1, 1, 1, 1, 0, 0],
+            [0, 0, 1, 0, 0, 0, 0],
+        ];
+        let lives_to_draw = self.lives.min(5) as i32;
+        for i in 0..lives_to_draw {
+            let base_x = 4 + i * 9;
+            let base_y = 6;
+            for (row_idx, row) in LIFE_SHIP_SPRITE.iter().enumerate() {
+                for (col_idx, &cell) in row.iter().enumerate() {
+                    let color = match cell {
+                        1 => SHIP_RED,
+                        2 => SHIP_COCKPIT,
+                        3 => SHIP_THRUST,
+                        _ => continue,
+                    };
+                    self.plot_screen_pixel(base_x + col_idx as i32, base_y + row_idx as i32, color);
+                }
             }
         }
     }
@@ -365,11 +788,14 @@ impl Game {
             return;
         }
 
-        self.clear_screen();
+        self.clear_frame();
 
         let loop_count = self.world_mask;
         // `F` in JS: running Y height of the procedural mountain range (starts at 127).
         let mut mountain_y: f64 = 127.0;
+        // Cache every world column's mountain height so the top radar can draw the full
+        // 1024-pixel miniature mountain range without duplicating the terrain math.
+        let mut mountain_heights = [127.0_f64; WORLD_WIDTH as usize];
         // `L` in JS: non-zero when an entity should be spawned at the end of this `d` step.
         let mut spawn_code: u8 = 0;
 
@@ -385,9 +811,10 @@ impl Game {
             // Deterministic terrain slope: `F += Math.cos((d / 5) & -11)`.
             // Bitwise `& -11` clears bits 1 and 3, creating jagged plateau-like ridges.
             mountain_y += (((d / 5) & -11) as f64).cos();
+            mountain_heights[d as usize] = mountain_y;
             if m_x < 255 {
                 let color = hsl_to_rgb(25.0, 0.99, 0.50); // Warm orange-brown
-                self.plot_pixel(m_x, to_i32(mountain_y), color);
+                self.plot_playfield_pixel(m_x, to_i32(mountain_y), color);
             }
 
             // --- 2. Parallax Starfield Pixel ---
@@ -397,7 +824,7 @@ impl Game {
             let star_y = to_i32(199.0 * mountain_y) & self.world_mask;
             if star_y < 99 && star_x < 255.0 {
                 let color = hsl_to_rgb(-mountain_y, 0.99, 0.50); // Dark blue / violet hues
-                self.plot_pixel(to_i32(star_x), star_y, color);
+                self.plot_playfield_pixel(to_i32(star_x), star_y, color);
             }
 
             // --- 3. Player Rainbow Laser Pixel ---
@@ -413,7 +840,7 @@ impl Game {
                     let laser_y = to_i32(player.y);
                     if laser_x < 255 {
                         let color = hsl_to_rgb((5 * d) as f64, 0.99, 0.50);
-                        self.plot_pixel(laser_x, laser_y, color);
+                        self.plot_playfield_pixel(laser_x, laser_y, color);
                     }
                 }
             }
@@ -510,11 +937,14 @@ impl Game {
                         // Entity is vertically aligned (`|r| < 4`), within laser range (`p < 130`),
                         // and in front of the ship (`q * D < 1` because `q = player_x - entity_x`).
                         self.entities[idx].warp_explosion -= 1;
-                        match entity_kind {
-                            EntityKind::Lander => self.score += 150,
-                            EntityKind::Mutant => self.score += 200,
-                            EntityKind::Bullet => self.score += 50,
-                            _ => {}
+                        let points = match entity_kind {
+                            EntityKind::Lander => 150,
+                            EntityKind::Mutant => 200,
+                            EntityKind::Bullet => 50,
+                            _ => 0,
+                        };
+                        if points > 0 {
+                            self.add_score(points);
                         }
                     }
 
@@ -700,7 +1130,7 @@ impl Game {
                         ) & self.world_mask;
                         let py = to_i32(ey + (scale * (u_bit as i32 - 3)) as f64);
                         if px < 255 {
-                            self.plot_pixel(px, py, color);
+                            self.plot_playfield_pixel(px, py, color);
                         }
                     }
                 }
@@ -732,6 +1162,21 @@ impl Game {
                 spawn_code = 0;
             }
         }
+
+        // Fill the final column (`1023`) so every wrapped radar sample has a smooth height.
+        mountain_heights[WORLD_MASK as usize] = mountain_heights[(WORLD_MASK - 1) as usize];
+
+        // Draw any active Hyperspace arrival sparkle in the playfield and step visual flashes.
+        self.render_hyperspace_sparkle();
+        if self.hyperspace_flash > 0 {
+            self.hyperspace_flash -= 1;
+        }
+        if self.bomb_flash > 0 {
+            self.bomb_flash -= 1;
+        }
+
+        // Render the classic top-of-screen Defender radar, smart bomb stack, and life ships.
+        self.render_radar_hud(&mountain_heights);
 
         self.ticks = self.ticks.wrapping_add(1);
     }
@@ -1080,14 +1525,16 @@ mod tests {
         assert_eq!(69 ^ SPRITE_DATA[34], 0);
     }
 
-    /// Verifies that screen dimensions match the original `510 × 320` canvas.
+    /// Verifies that screen dimensions include the `28`-px radar HUD above the `255 × 160` playfield (`510 × 376`).
     #[test]
-    fn screen_dimensions_match_js1k_510x320() {
+    fn screen_dimensions_include_radar_510x376() {
         assert_eq!(LOGICAL_WIDTH, 255);
         assert_eq!(LOGICAL_HEIGHT, 160);
+        assert_eq!(RADAR_HEIGHT, 28);
+        assert_eq!(TOTAL_LOGICAL_HEIGHT, 188);
         assert_eq!(SCREEN_WIDTH, 510);
-        assert_eq!(SCREEN_HEIGHT, 320);
-        assert_eq!(FRAMEBUFFER_SIZE, 510 * 320 * 4);
+        assert_eq!(SCREEN_HEIGHT, 376);
+        assert_eq!(FRAMEBUFFER_SIZE, 510 * 376 * 4);
     }
 
     /// Verifies that ticks after Game Over leave the final rendered frame frozen in place.
@@ -1271,5 +1718,300 @@ mod tests {
         game.reset();
         assert_eq!(game.lives, 3);
         assert!(!game.game_over);
+    }
+
+    /// Helper for tests: reads the `(R, G, B)` tuple at logical screen coordinate `(lx, ly)`.
+    fn logical_pixel_rgb(game: &Game, lx: usize, ly: usize) -> (u8, u8, u8) {
+        let sx = lx * PIXEL_SCALE;
+        let sy = ly * PIXEL_SCALE;
+        let idx = (sy * SCREEN_WIDTH + sx) * 4;
+        (
+            game.framebuffer[idx],
+            game.framebuffer[idx + 1],
+            game.framebuffer[idx + 2],
+        )
+    }
+
+    /// Verifies Smart Bomb initial count, destroying on-screen enemies (active & warping),
+    /// sparing off-screen enemies and humans, unlinking abducted humans, and awarding points.
+    #[test]
+    fn smart_bomb_destroys_on_screen_enemies_and_unlinks_humans() {
+        let mut game = Game::new();
+        assert_eq!(game.smart_bombs, INITIAL_SMART_BOMBS);
+        assert_eq!(game.smart_bombs, 3);
+
+        game.tick(); // Spawn player at x = 0, camera_x = 0 (visible world X: -127..+127)
+
+        // Add an abducted Human + on-screen Lander pair (x = 40 -> screen_x = 167 < 255).
+        let human_id = 200;
+        let lander_id = 201;
+        game.entities.push(Entity {
+            id: human_id,
+            kind: EntityKind::Human,
+            speed: EntityKind::Human.speed(),
+            warp_explosion: 0,
+            target_id: Some(lander_id),
+            vx: 0.0,
+            vy: -1.0,
+            timer: 0,
+            x: 40.0,
+            y: 80.0,
+        });
+        game.entities.push(Entity {
+            id: lander_id,
+            kind: EntityKind::Lander,
+            speed: EntityKind::Lander.speed(),
+            warp_explosion: 0,
+            target_id: Some(human_id),
+            vx: 0.0,
+            vy: 0.0,
+            timer: 50,
+            x: 40.0,
+            y: 72.0,
+        });
+        // Add an on-screen warping-in Mutant (x = 80 -> screen_x = 207 < 255).
+        game.entities.push(Entity {
+            id: 202,
+            kind: EntityKind::Mutant,
+            speed: EntityKind::Mutant.speed(),
+            warp_explosion: 12,
+            target_id: None,
+            vx: 0.0,
+            vy: 0.0,
+            timer: 50,
+            x: 80.0,
+            y: 60.0,
+        });
+        // Add an on-screen Bullet (x = -20 -> screen_x = 107 < 255).
+        game.entities.push(Entity {
+            id: 203,
+            kind: EntityKind::Bullet,
+            speed: EntityKind::Bullet.speed(),
+            warp_explosion: 0,
+            target_id: None,
+            vx: 1.0,
+            vy: 0.0,
+            timer: 50,
+            x: 1004.0,
+            y: 70.0,
+        });
+        // Add an OFF-SCREEN Lander (x = 500 -> screen_x = 627 >= 255).
+        game.entities.push(Entity {
+            id: 204,
+            kind: EntityKind::Lander,
+            speed: EntityKind::Lander.speed(),
+            warp_explosion: 0,
+            target_id: None,
+            vx: 0.0,
+            vy: 0.0,
+            timer: 50,
+            x: 500.0,
+            y: 50.0,
+        });
+
+        game.trigger_smart_bomb();
+
+        assert_eq!(game.smart_bombs, 2);
+        assert_eq!(game.bomb_flash, 8);
+        // 150 (Lander) + 200 (Mutant) + 50 (Bullet) = 400
+        assert_eq!(game.score, 400);
+
+        let human = game.entities.iter().find(|e| e.id == human_id).unwrap();
+        assert_eq!(human.warp_explosion, 0, "smart bomb must not harm humans");
+        assert_eq!(
+            human.target_id, None,
+            "abducted human must be unlinked when lander is smart-bombed"
+        );
+
+        let lander = game.entities.iter().find(|e| e.id == lander_id).unwrap();
+        assert_eq!(lander.warp_explosion, -1);
+
+        let mutant = game.entities.iter().find(|e| e.id == 202).unwrap();
+        assert_eq!(mutant.warp_explosion, -1);
+
+        let bullet = game.entities.iter().find(|e| e.id == 203).unwrap();
+        assert_eq!(bullet.warp_explosion, -1);
+
+        let offscreen = game.entities.iter().find(|e| e.id == 204).unwrap();
+        assert_eq!(
+            offscreen.warp_explosion, 0,
+            "off-screen enemies must survive smart bomb"
+        );
+
+        // Next tick should render the white/cyan playfield flash and decrement `bomb_flash`.
+        game.tick();
+        assert_eq!(game.bomb_flash, 7);
+    }
+
+    /// Verifies that crossing 10,000 points awards a bonus Smart Bomb and that
+    /// Smart Bomb is a no-op when out of bombs, exploding, or game over.
+    #[test]
+    fn smart_bomb_bonus_at_10000_points_and_guard_conditions() {
+        let mut game = Game::new();
+        game.tick(); // Spawn player
+
+        // Put score right below the 10,000 threshold, with 1 bomb left.
+        game.score = 9_900;
+        game.smart_bombs = 1;
+        game.entities.push(Entity {
+            id: 300,
+            kind: EntityKind::Lander,
+            speed: 0.0,
+            warp_explosion: 0,
+            target_id: None,
+            vx: 0.0,
+            vy: 0.0,
+            timer: 50,
+            x: 20.0,
+            y: 70.0,
+        });
+
+        // Detonating spends 1 bomb (1 -> 0), awards +150 pts (10,050 >= 10,000),
+        // which immediately awards +1 bonus bomb (0 -> 1) and advances threshold to 20,000.
+        game.trigger_smart_bomb();
+        assert_eq!(game.score, 10_050);
+        assert_eq!(game.smart_bombs, 1);
+        assert_eq!(game.next_bomb_score, 20_000);
+
+        // Spend the last bomb -> 0 left, further triggers do nothing.
+        game.trigger_smart_bomb();
+        assert_eq!(game.smart_bombs, 0);
+        game.bomb_flash = 0;
+        game.trigger_smart_bomb();
+        assert_eq!(game.smart_bombs, 0);
+        assert_eq!(game.bomb_flash, 0);
+
+        // Exploding player cannot trigger smart bomb.
+        game.smart_bombs = 2;
+        game.entities[0].warp_explosion = -1;
+        game.trigger_smart_bomb();
+        assert_eq!(game.smart_bombs, 2);
+
+        // Game over cannot trigger smart bomb.
+        game.entities[0].warp_explosion = 0;
+        game.game_over = true;
+        game.trigger_smart_bomb();
+        assert_eq!(game.smart_bombs, 2);
+    }
+
+    /// Verifies unlimited Hyperspace teleports to random positions, updates camera,
+    /// clears velocity/firing, and grants no invulnerability.
+    #[test]
+    fn hyperspace_teleports_randomly_and_updates_camera() {
+        let mut game = Game::new();
+        game.tick(); // Spawn player
+
+        let mut distinct_positions = std::collections::HashSet::new();
+        for _ in 0..20 {
+            game.entities[0].vx = 18.0;
+            game.firing = true;
+            game.trigger_hyperspace();
+
+            let p = &game.entities[0];
+            assert!(
+                p.x >= 0.0 && p.x < WORLD_WIDTH as f64,
+                "hyperspace x out of range: {}",
+                p.x
+            );
+            assert!(
+                p.y >= 12.0 && p.y < 132.0,
+                "hyperspace y out of range: {}",
+                p.y
+            );
+            assert_eq!(p.vx, 0.0);
+            assert_eq!(game.camera_x, p.x);
+            assert!(!game.firing);
+            assert_eq!(
+                p.warp_explosion, 0,
+                "hyperspace must not grant invulnerability"
+            );
+            assert!(game.hyperspace_flash > 0);
+            distinct_positions.insert((p.x as i32, p.y as i32));
+        }
+
+        assert!(
+            distinct_positions.len() >= 15,
+            "expected varied hyperspace destinations, got only {}",
+            distinct_positions.len()
+        );
+
+        // Exploding or game-over player cannot hyperspace.
+        let frozen_pos = (game.entities[0].x, game.entities[0].y);
+        game.entities[0].warp_explosion = -2;
+        game.trigger_hyperspace();
+        assert_eq!((game.entities[0].x, game.entities[0].y), frozen_pos);
+    }
+
+    /// Verifies that the top 28 logical rows render the royal-blue radar frame & divider,
+    /// white viewport brackets, miniature mountains, player `+`, smart bomb icons, and life ships.
+    #[test]
+    fn radar_hud_renders_frame_brackets_blips_bombs_and_lives() {
+        let mut game = Game::new();
+        for _ in 0..15 {
+            game.tick();
+        }
+        // Add an active Lander so enemy blips are rendered on radar too.
+        game.entities.push(Entity {
+            id: 400,
+            kind: EntityKind::Lander,
+            speed: 0.0,
+            warp_explosion: 0,
+            target_id: None,
+            vx: 0.0,
+            vy: 0.0,
+            timer: 99,
+            x: 100.0,
+            y: 40.0,
+        });
+        game.tick();
+
+        // Full-width royal-blue divider at `ly = 27`.
+        assert_eq!(logical_pixel_rgb(&game, 0, 27), (40, 60, 235));
+        assert_eq!(logical_pixel_rgb(&game, 128, 27), (40, 60, 235));
+        assert_eq!(logical_pixel_rgb(&game, 254, 27), (40, 60, 235));
+
+        // Radar top frame (`ly = 0`, `lx = 63..=192`) and side walls (`lx = 63, 192`).
+        assert_eq!(logical_pixel_rgb(&game, 63, 0), (40, 60, 235));
+        assert_eq!(logical_pixel_rgb(&game, 192, 0), (40, 60, 235));
+        assert_eq!(logical_pixel_rgb(&game, 63, 14), (40, 60, 235));
+        assert_eq!(logical_pixel_rgb(&game, 192, 14), (40, 60, 235));
+
+        // White viewport brackets at `lx = 112..=143`, `ly = 1` and `ly = 26`, plus 2px corners.
+        assert_eq!(logical_pixel_rgb(&game, 112, 1), (255, 255, 255));
+        assert_eq!(logical_pixel_rgb(&game, 143, 1), (255, 255, 255));
+        assert_eq!(logical_pixel_rgb(&game, 112, 26), (255, 255, 255));
+        assert_eq!(logical_pixel_rgb(&game, 143, 26), (255, 255, 255));
+        assert_eq!(logical_pixel_rgb(&game, 112, 3), (255, 255, 255));
+        assert_eq!(logical_pixel_rgb(&game, 143, 24), (255, 255, 255));
+
+        // Miniature orange-brown mountains inside radar box (`lx = 64..192`, `ly = 2..=25`).
+        let mountain_pixels = (64..192)
+            .flat_map(|lx| (2..=25).map(move |ly| (lx, ly)))
+            .filter(|&(lx, ly)| logical_pixel_rgb(&game, lx, ly) == (195, 95, 20))
+            .count();
+        assert!(
+            mountain_pixels >= 80,
+            "expected miniature mountain range across radar, found {mountain_pixels} pixels"
+        );
+
+        // Player bright white `+` cross must render inside the white viewport brackets (`lx = 112..=143`).
+        // With `player.x == camera_x == 0` and `player.y == 70`, the `+` center is at `(128, 12)`.
+        assert_eq!(logical_pixel_rgb(&game, 128, 12), (255, 255, 255));
+        assert_eq!(logical_pixel_rgb(&game, 127, 12), (255, 255, 255));
+        assert_eq!(logical_pixel_rgb(&game, 129, 12), (255, 255, 255));
+        assert_eq!(logical_pixel_rgb(&game, 128, 11), (255, 255, 255));
+        assert_eq!(logical_pixel_rgb(&game, 128, 13), (255, 255, 255));
+
+        // Smart Bomb icons at `lx = 52..=58`: 3 icons at `ly = 2, 7, 12`, none at 4th slot (`ly = 17`).
+        assert_ne!(logical_pixel_rgb(&game, 54, 3), (0, 0, 0));
+        assert_ne!(logical_pixel_rgb(&game, 54, 8), (0, 0, 0));
+        assert_ne!(logical_pixel_rgb(&game, 54, 13), (0, 0, 0));
+        assert_eq!(logical_pixel_rgb(&game, 54, 18), (0, 0, 0));
+
+        // Reserve Life Ship icons on upper-left (`lx = 4, 13, 22` at `ly = 8` for 3 lives).
+        assert_eq!(logical_pixel_rgb(&game, 5, 8), (255, 45, 45));
+        assert_eq!(logical_pixel_rgb(&game, 14, 8), (255, 45, 45));
+        assert_eq!(logical_pixel_rgb(&game, 23, 8), (255, 45, 45));
+        assert_eq!(logical_pixel_rgb(&game, 32, 8), (0, 0, 0));
     }
 }

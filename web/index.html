@@ -24,6 +24,10 @@
           <span id="lives" class="value">3</span>
         </div>
         <div class="hud-item">
+          <span class="label">BOMBS</span>
+          <span id="bombs" class="value">3</span>
+        </div>
+        <div class="hud-item">
           <span class="label">HUMANS</span>
           <span id="humans" class="value">10</span>
         </div>
@@ -40,7 +44,7 @@
 
     <div class="stage">
       <div class="screen-wrap">
-        <canvas id="game" width="510" height="320" aria-label="Defender game canvas"></canvas>
+        <canvas id="game" width="510" height="376" aria-label="Defender game canvas"></canvas>
         <div id="overlay" class="overlay hidden" role="status" aria-live="polite">
           <h2 id="overlay-title">GAME OVER</h2>
           <p id="overlay-message">Final Score: <strong id="final-score">0</strong></p>
@@ -53,6 +57,8 @@
       <span><kbd>&larr;</kbd> <kbd>&rarr;</kbd> Thrust</span>
       <span><kbd>&uarr;</kbd> <kbd>&darr;</kbd> Climb / Dive</span>
       <span><kbd>Space</kbd> Fire Laser</span>
+      <span><kbd>Z</kbd> Smart Bomb</span>
+      <span><kbd>H</kbd> Hyperspace</span>
       <span><kbd>P</kbd> Pause</span>
       <span><kbd>R</kbd> Restart</span>
     </footer>
